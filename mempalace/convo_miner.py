@@ -353,6 +353,14 @@ def scan_convos(convo_dir: str) -> list:
     caller can tell why an apparent conversation directory yielded no files.
     """
     convo_path = Path(convo_dir).expanduser().resolve()
+    if convo_path.is_file():
+        if convo_path.suffix.lower() in CONVO_EXTENSIONS and not convo_path.is_symlink():
+            try:
+                if convo_path.stat().st_size <= MAX_FILE_SIZE:
+                    return [convo_path]
+            except OSError:
+                return []
+        return []
     files = []
     for root, dirs, filenames in os.walk(convo_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
@@ -383,7 +391,18 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _file_chunks_locked(
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    *,
+    purge: bool = True,
+    respect_already_mined: bool = True,
+):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -398,18 +417,21 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         # Re-check after lock — another agent may have just finished this file
         # at the current schema. A stale-version hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file, extract_mode=extract_mode):
+        if respect_already_mined and file_already_mined(
+            collection, source_file, extract_mode=extract_mode
+        ):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first. When the normalize schema bumps,
         # file_already_mined() returned False for pre-v2 drawers — clean
         # them out so the source doesn't end up with mixed old/new drawers.
-        try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
-        except Exception:
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+        if purge:
+            try:
+                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
+                if delete_ids:
+                    collection.delete(ids=delete_ids)
+            except Exception:
+                logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep
@@ -456,6 +478,33 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 if "already exists" not in str(e).lower():
                     raise
     return drawers_added, room_counts_delta, False
+
+
+def _has_existing_convo_drawers(collection, source_file: str, extract_mode: str) -> bool:
+    """Return True when any drawer exists for ``source_file`` in ``extract_mode``.
+
+    This is intentionally weaker than ``file_already_mined()``: append-only
+    incremental mining only needs to know whether the caller has any prior
+    state to overlap against. A stale-version result still counts as "existing
+    drawers" for the defensive fallback path.
+    """
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        for meta in metadatas:
+            if _metadata_matches_extract_mode(meta or {}, extract_mode):
+                return True
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return False
 
 
 def _is_ai_tool_path(path: Path) -> bool:
@@ -520,6 +569,8 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    from_chunk: int = 0,
+    quiet: bool = False,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -552,6 +603,8 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            from_chunk=from_chunk,
+            quiet=quiet,
         )
 
     with mine_palace_lock(palace_path):
@@ -563,10 +616,12 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            from_chunk=from_chunk,
+            quiet=quiet,
         )
 
 
-def _mine_convos_impl(
+def _mine_convos_impl(  # noqa: C901 - branchy by necessity: scan, chunk, fallback, dry-run, and append-only paths
     convo_dir: str,
     palace_path: str,
     wing: str = None,
@@ -574,6 +629,8 @@ def _mine_convos_impl(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    from_chunk: int = 0,
+    quiet: bool = False,
 ):
     from .config import MempalaceConfig
 
@@ -595,17 +652,21 @@ def _mine_convos_impl(
 
     files = scan_convos(convo_dir)
 
-    print(f"\n{'=' * 55}")
-    print("  MemPalace Mine — Conversations")
-    print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
-    print(f"  Source:  {convo_path}")
-    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
-    print(f"  Files:   {len(files)}{limit_suffix}")
-    print(f"  Palace:  {palace_path}")
-    if dry_run:
-        print("  DRY RUN — nothing will be filed")
-    print(f"{'-' * 55}\n")
+    if from_chunk < 0:
+        raise ValueError(f"from_chunk must be >= 0, got {from_chunk}")
+
+    if not quiet:
+        print(f"\n{'=' * 55}")
+        print("  MemPalace Mine — Conversations")
+        print(f"{'=' * 55}")
+        print(f"  Wing:    {wing}")
+        print(f"  Source:  {convo_path}")
+        limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+        print(f"  Files:   {len(files)}{limit_suffix}")
+        print(f"  Palace:  {palace_path}")
+        if dry_run:
+            print("  DRY RUN — nothing will be filed")
+        print(f"{'-' * 55}\n")
 
     collection = get_collection(palace_path) if not dry_run else None
 
@@ -623,13 +684,19 @@ def _mine_convos_impl(
     files_skipped = 0
     files_processed = 0
     room_counts = defaultdict(int)
+    file_results = []
+
+    if from_chunk > 0 and len(files) > 1:
+        raise ValueError(
+            "--from-chunk is only valid when the target resolves to a single convo file"
+        )
 
     for i, filepath in enumerate(files, 1):
         files_processed = i
         source_file = str(filepath)
 
         # Skip if already filed at current NORMALIZE_VERSION
-        if not dry_run and source_file in mined_set:
+        if from_chunk == 0 and not dry_run and source_file in mined_set:
             files_skipped += 1
             continue
 
@@ -664,6 +731,24 @@ def _mine_convos_impl(
                 _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
+        total_chunks = len(chunks)
+        existing_drawers = False
+        if from_chunk > 0 and not dry_run:
+            existing_drawers = _has_existing_convo_drawers(collection, source_file, extract_mode)
+            if not existing_drawers:
+                if not quiet:
+                    print(
+                        f"  WARN: {filepath.name[:50]:50} has no existing drawers; "
+                        "falling back to a full mine"
+                    )
+                from_chunk = 0
+
+        chunks_to_file = chunks
+        if from_chunk > 0 and total_chunks > from_chunk:
+            chunks_to_file = chunks[from_chunk:]
+        elif from_chunk > 0 and total_chunks <= from_chunk:
+            chunks_to_file = []
+
         # Detect room from content (general mode uses memory_type instead)
         if extract_mode != "general":
             room = detect_convo_room(content)
@@ -674,19 +759,34 @@ def _mine_convos_impl(
             if extract_mode == "general":
                 from collections import Counter
 
-                type_counts = Counter(c.get("memory_type", "general") for c in chunks)
+                type_counts = Counter(c.get("memory_type", "general") for c in chunks_to_file)
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
+                if not quiet:
+                    print(
+                        f"    [DRY RUN] {filepath.name} → {len(chunks_to_file)} memories ({types_str})"
+                    )
             else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
-            total_drawers += len(chunks)
+                if not quiet:
+                    print(
+                        f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks_to_file)} drawers)"
+                    )
+            total_drawers += len(chunks_to_file)
             # Track room counts
             if extract_mode == "general":
-                for c in chunks:
+                for c in chunks_to_file:
                     room_counts[c.get("memory_type", "general")] += 1
             else:
                 room_counts[room] += 1
             files_mined += 1
+            file_results.append(
+                {
+                    "source_file": source_file,
+                    "total_chunks": total_chunks,
+                    "new_chunks": len(chunks_to_file),
+                    "skipped": False,
+                    "from_chunk": from_chunk,
+                }
+            )
             if limit > 0 and files_mined >= limit:
                 break
             continue
@@ -697,7 +797,15 @@ def _mine_convos_impl(
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection,
+            source_file,
+            chunks_to_file,
+            wing,
+            room,
+            agent,
+            extract_mode,
+            purge=from_chunk == 0,
+            respect_already_mined=from_chunk == 0,
         )
         if skipped:
             files_skipped += 1
@@ -707,24 +815,51 @@ def _mine_convos_impl(
 
         total_drawers += drawers_added
         files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        file_results.append(
+            {
+                "source_file": source_file,
+                "total_chunks": total_chunks,
+                "new_chunks": drawers_added,
+                "skipped": False,
+                "from_chunk": from_chunk,
+            }
+        )
+        if not quiet:
+            print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
         if limit > 0 and files_mined >= limit:
             break
 
     if not dry_run:
         _validate_palace_fts5_after_mine(palace_path)
 
-    print(f"\n{'=' * 55}")
-    print("  Done.")
-    print(f"  Files processed: {files_processed - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
-    print(f"  Drawers filed: {total_drawers}")
-    if room_counts:
-        print("\n  By room:")
-        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
-    print('\n  Next: mempalace search "what you\'re looking for"')
-    print(f"{'=' * 55}\n")
+    if not quiet:
+        print(f"\n{'=' * 55}")
+        print("  Done.")
+        print(f"  Files processed: {files_processed - files_skipped}")
+        print(f"  Files skipped (already filed): {files_skipped}")
+        print(f"  Drawers filed: {total_drawers}")
+        if room_counts:
+            print("\n  By room:")
+            for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
+                print(f"    {room:20} {count} files")
+        print('\n  Next: mempalace search "what you\'re looking for"')
+        print(f"{'=' * 55}\n")
+
+    result = {
+        "convo_dir": str(convo_path),
+        "palace_path": palace_path,
+        "wing": wing,
+        "extract_mode": extract_mode,
+        "from_chunk": from_chunk,
+        "files_processed": files_processed,
+        "files_skipped": files_skipped,
+        "files_mined": files_mined,
+        "drawers_added": total_drawers,
+        "files": file_results,
+    }
+    if len(file_results) == 1:
+        result.update(file_results[0])
+    return result
 
 
 if __name__ == "__main__":

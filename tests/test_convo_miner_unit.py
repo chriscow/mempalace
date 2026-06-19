@@ -342,6 +342,12 @@ class TestScanConvos:
         assert ".md" in extensions
         assert ".png" not in extensions
 
+    def test_scan_accepts_single_transcript_file(self, tmp_path):
+        transcript = tmp_path / "session.jsonl"
+        transcript.write_text("> hi\nthere\n", encoding="utf-8")
+        files = scan_convos(str(transcript))
+        assert files == [transcript.resolve()]
+
     def test_scan_skips_git_dir(self, tmp_path):
         git_dir = tmp_path / ".git"
         git_dir.mkdir()

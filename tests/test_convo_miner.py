@@ -14,6 +14,30 @@ from mempalace.convo_miner import (
 from mempalace.palace import MineAlreadyRunning, file_already_mined
 
 
+def _write_convo(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def _read_convo_drawers(palace_path: str, source_file: str) -> list[dict]:
+    client = chromadb.PersistentClient(path=palace_path)
+    col = client.get_collection("mempalace_drawers")
+    rows = col.get(where={"source_file": source_file}, include=["documents", "metadatas"])
+    records = []
+    for drawer_id, document, meta in zip(
+        rows.get("ids") or [], rows.get("documents") or [], rows.get("metadatas") or []
+    ):
+        meta = meta or {}
+        records.append(
+            {
+                "drawer_id": drawer_id,
+                "document": document,
+                "chunk_index": meta.get("chunk_index"),
+                "meta": meta,
+            }
+        )
+    return sorted(records, key=lambda item: item["chunk_index"])
+
+
 def test_convo_mining():
     tmpdir = tempfile.mkdtemp()
     with open(os.path.join(tmpdir, "chat.txt"), "w") as f:
@@ -195,6 +219,198 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         del col, client
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_default_path_remains_skipped(tmp_path, capsys):
+    convo = tmp_path / "session.jsonl"
+    _write_convo(
+        convo,
+        (
+            "> What did we decide about the API?\n"
+            "We decided to keep the API local because it avoids external dependencies.\n\n"
+            "> What did we decide about storage?\n"
+            "We decided to keep the storage append-only so re-mines stay idempotent.\n"
+        ),
+    )
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(str(convo), palace_path, wing="test")
+    capsys.readouterr()
+    before = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    second = mine_convos(str(convo), palace_path, wing="test")
+    capsys.readouterr()
+    after = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    assert second["files_skipped"] == 1
+    assert [row["drawer_id"] for row in before] == [row["drawer_id"] for row in after]
+    assert [row["document"] for row in before] == [row["document"] for row in after]
+
+
+def test_mine_convos_incremental_tail_append_preserves_prefix(tmp_path, capsys):
+    convo = tmp_path / "session.jsonl"
+    initial = (
+        "> What is alpha?\n"
+        "Alpha is the first item and has enough detail to become a drawer.\n\n"
+        "> What is beta?\n"
+        "Beta is the second item and also has enough detail to become a drawer.\n"
+    )
+    appended = (
+        initial + "\n> What is gamma?\n"
+        "Gamma is the new item appended later and should only add tail drawers.\n"
+    )
+    _write_convo(convo, initial)
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(str(convo), palace_path, wing="test")
+    capsys.readouterr()
+    before = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    _write_convo(convo, appended)
+    result = mine_convos(str(convo), palace_path, wing="test", from_chunk=len(before) - 1)
+    capsys.readouterr()
+    after = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    assert result["new_chunks"] == 2
+    assert len(after) == 3
+    assert len({row["drawer_id"] for row in after}) == 3
+    assert before[0]["drawer_id"] == after[0]["drawer_id"]
+    assert before[0]["document"] == after[0]["document"]
+    assert after[1]["chunk_index"] == 1
+    assert after[2]["chunk_index"] == 2
+
+
+def test_mine_convos_overlap_rewrites_boundary_chunk(tmp_path, capsys):
+    run1 = (
+        "> What happened in the draft?\n"
+        "The draft is mostly done and needs one more pass before shipping.\n\n"
+        "> What did the assistant say?\n"
+        "Part 1 of the final answer is here and it is intentionally incomplete.\n"
+    )
+    run2 = (
+        "> What happened in the draft?\n"
+        "The draft is mostly done and needs one more pass before shipping.\n\n"
+        "> What did the assistant say?\n"
+        "Part 1 of the final answer is here, Part 2 fills in the missing detail, and the reply continues.\n\n"
+        "> What happened next?\n"
+        "A follow-up exchange was added after the assistant finished the boundary turn.\n"
+    )
+
+    def _mine_case(palace_name: str, from_chunk: int):
+        convo = tmp_path / f"{palace_name}.jsonl"
+        palace_path = str(tmp_path / palace_name)
+        _write_convo(convo, run1)
+        mine_convos(str(convo), palace_path, wing="test")
+        capsys.readouterr()
+        _write_convo(convo, run2)
+        mine_convos(str(convo), palace_path, wing="test", from_chunk=from_chunk)
+        capsys.readouterr()
+        return _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    with_overlap = _mine_case("palace_overlap", from_chunk=1)
+    without_overlap = _mine_case("palace_no_overlap", from_chunk=2)
+
+    boundary_with_overlap = next(row for row in with_overlap if row["chunk_index"] == 1)
+    boundary_without_overlap = next(row for row in without_overlap if row["chunk_index"] == 1)
+
+    assert "Part 2" in boundary_with_overlap["document"]
+    assert "Part 2" not in boundary_without_overlap["document"]
+    assert "Part 1" in boundary_without_overlap["document"]
+
+
+def test_mine_convos_incremental_rerun_is_idempotent(tmp_path, capsys):
+    convo = tmp_path / "session.jsonl"
+    initial = (
+        "> What is alpha?\n"
+        "Alpha is the first item and has enough detail to become a drawer.\n\n"
+        "> What is beta?\n"
+        "Beta is the second item and also has enough detail to become a drawer.\n"
+    )
+    appended = (
+        initial + "\n> What is gamma?\n"
+        "Gamma is the new item appended later and should only add tail drawers.\n"
+    )
+    _write_convo(convo, initial)
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(str(convo), palace_path, wing="test")
+    capsys.readouterr()
+    _write_convo(convo, appended)
+    mine_convos(str(convo), palace_path, wing="test", from_chunk=1)
+    capsys.readouterr()
+    first = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    second = mine_convos(str(convo), palace_path, wing="test", from_chunk=1)
+    capsys.readouterr()
+    after = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    assert second["new_chunks"] == 2
+    assert [row["drawer_id"] for row in first] == [row["drawer_id"] for row in after]
+    assert [row["document"] for row in first] == [row["document"] for row in after]
+
+
+def test_mine_convos_safe_noop_when_from_chunk_is_past_end(tmp_path, capsys):
+    convo = tmp_path / "session.jsonl"
+    _write_convo(
+        convo,
+        (
+            "> What is alpha?\n"
+            "Alpha is the first item and has enough detail to become a drawer.\n\n"
+            "> What is beta?\n"
+            "Beta is the second item and also has enough detail to become a drawer.\n"
+        ),
+    )
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(str(convo), palace_path, wing="test")
+    capsys.readouterr()
+    before = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    result = mine_convos(str(convo), palace_path, wing="test", from_chunk=99)
+    capsys.readouterr()
+    after = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    assert result["new_chunks"] == 0
+    assert [row["drawer_id"] for row in before] == [row["drawer_id"] for row in after]
+    assert [row["document"] for row in before] == [row["document"] for row in after]
+
+
+def test_mine_convos_falls_back_to_full_mine_when_state_is_missing(tmp_path, capsys):
+    convo = tmp_path / "session.jsonl"
+    _write_convo(
+        convo,
+        (
+            "> What is alpha?\n"
+            "Alpha is the first item and has enough detail to become a drawer.\n\n"
+            "> What is beta?\n"
+            "Beta is the second item and also has enough detail to become a drawer.\n"
+        ),
+    )
+    palace_path = str(tmp_path / "palace")
+
+    result = mine_convos(str(convo), palace_path, wing="test", from_chunk=1)
+    capsys.readouterr()
+    after = _read_convo_drawers(palace_path, str(convo.resolve()))
+
+    assert result["new_chunks"] == 2
+    assert len(after) == 2
+    assert {row["chunk_index"] for row in after} == {0, 1}
+
+
+def test_mine_convos_rejects_multiple_files_when_from_chunk_is_set(tmp_path):
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    _write_convo(
+        convo_dir / "one.jsonl",
+        "> What is alpha?\nAlpha is a chunk that is long enough to count.\n",
+    )
+    _write_convo(
+        convo_dir / "two.jsonl",
+        "> What is beta?\nBeta is another chunk that is also long enough to count.\n",
+    )
+
+    with pytest.raises(ValueError, match="single convo file"):
+        mine_convos(str(convo_dir), str(tmp_path / "palace"), wing="test", from_chunk=1)
 
 
 def _hold_palace_lock_in_child(palace_path, ready_flag, release_flag):

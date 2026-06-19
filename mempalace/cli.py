@@ -538,6 +538,18 @@ def cmd_mine(args):
         print("mempalace: --background requires --daemon", file=sys.stderr)
         sys.exit(2)
 
+    from_chunk = int(getattr(args, "from_chunk", 0) or 0)
+    emit_json = bool(getattr(args, "json", False))
+    if from_chunk < 0:
+        print("mempalace: --from-chunk must be >= 0", file=sys.stderr)
+        sys.exit(2)
+    if from_chunk and args.mode != "convos":
+        print("mempalace: --from-chunk is only valid with --mode convos", file=sys.stderr)
+        sys.exit(2)
+    if emit_json and args.mode != "convos":
+        print("mempalace: --json is only supported with --mode convos", file=sys.stderr)
+        sys.exit(2)
+
     if getattr(args, "daemon", False):
         payload = {
             "source": args.dir,
@@ -551,6 +563,8 @@ def cmd_mine(args):
             "include_ignored": include_ignored,
             "max_chunks_per_file": getattr(args, "max_chunks_per_file", None),
             "redetect_origin": getattr(args, "redetect_origin", False),
+            "from_chunk": from_chunk,
+            "json": emit_json,
         }
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
         return
@@ -571,7 +585,7 @@ def cmd_mine(args):
         if args.mode == "convos":
             from .convo_miner import mine_convos
 
-            mine_convos(
+            result = mine_convos(
                 convo_dir=args.dir,
                 palace_path=palace_path,
                 wing=args.wing,
@@ -579,7 +593,13 @@ def cmd_mine(args):
                 limit=args.limit,
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
+                from_chunk=from_chunk,
+                quiet=emit_json,
             )
+            if emit_json:
+                import json
+
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.mode == "extract":
             from .format_miner import mine_formats
 
@@ -612,6 +632,9 @@ def cmd_mine(args):
         # nohup / scripts can detect the contention.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
+    except ValueError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(2)
     except MineValidationError as exc:
         # PRAGMA quick_check on chroma.sqlite3 returned errors at end of mine.
         # The corruption may pre-date the mine; we surface it here so automation
@@ -1657,6 +1680,20 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    p_mine.add_argument(
+        "--from-chunk",
+        type=int,
+        default=0,
+        help=(
+            "Conversation-only incremental mine offset. When >0, mine only the tail "
+            "of a single transcript and preserve existing drawers."
+        ),
+    )
+    p_mine.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON summary (convos mode only)",
     )
     from . import miner as _miner_for_default
 

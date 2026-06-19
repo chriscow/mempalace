@@ -1,5 +1,6 @@
 """Tests for mempalace.cli — the main CLI dispatcher."""
 
+import json
 import argparse
 import os
 import shlex
@@ -586,6 +587,8 @@ def test_cmd_mine_convos_mode(mock_config_cls):
         no_gitignore=False,
         include_ignored=[],
         extract="general",
+        from_chunk=0,
+        json=False,
     )
     with patch("mempalace.convo_miner.mine_convos") as mock_mine:
         cmd_mine(args)
@@ -597,7 +600,75 @@ def test_cmd_mine_convos_mode(mock_config_cls):
             limit=10,
             dry_run=True,
             extract_mode="general",
+            from_chunk=0,
+            quiet=False,
         )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_convos_mode_json_emits_summary(mock_config_cls, capsys):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/chats",
+        palace=None,
+        mode="convos",
+        wing="mywing",
+        agent="me",
+        limit=10,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="general",
+        from_chunk=2,
+        json=True,
+    )
+    result = {
+        "source_file": "/chats/session.jsonl",
+        "total_chunks": 7,
+        "new_chunks": 2,
+        "files": [{"source_file": "/chats/session.jsonl", "total_chunks": 7, "new_chunks": 2}],
+    }
+    with patch("mempalace.convo_miner.mine_convos", return_value=result) as mock_mine:
+        cmd_mine(args)
+
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert payload == result
+    mock_mine.assert_called_once_with(
+        convo_dir="/chats",
+        palace_path="/fake/palace",
+        wing="mywing",
+        agent="me",
+        limit=10,
+        dry_run=False,
+        extract_mode="general",
+        from_chunk=2,
+        quiet=True,
+    )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_rejects_from_chunk_for_projects_mode(mock_config_cls, capsys):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        from_chunk=1,
+        json=False,
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        cmd_mine(args)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "--from-chunk is only valid with --mode convos" in err
 
 
 @patch("mempalace.cli.MempalaceConfig")
